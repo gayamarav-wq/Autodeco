@@ -1,0 +1,106 @@
+# Auto Decorator - builds Windows (PC) + Android and merges them into ONE .geode file.
+#
+# Works with either layout:
+#   * the project files committed normally, or
+#   * a single source .zip in the repo root (handy when uploading from a phone, where folders can't be uploaded).
+#
+# The Geode SDK is pinned: "latest" may move to a Geode major built for a newer Geometry Dash than 2.2081.
+name: Build Auto Decorator
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+# A new push cancels the previous run of the same branch (uploading files one by one starts many runs).
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GEODE_SDK_VERSION: v5.10.1
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    strategy:
+      fail-fast: false          # one platform failing must not hide the others' errors
+      matrix:
+        config:
+          - { name: Windows,   os: windows-latest, target: Win64 }
+          - { name: Android32, os: ubuntu-latest,  target: Android32 }
+          - { name: Android64, os: ubuntu-latest,  target: Android64 }
+          # macOS is optional (slower, and billed at a higher rate on private repos).
+          # To also build for Mac, remove the "#" on the next line:
+          # - { name: macOS,     os: macos-latest,   target: MacOS }
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python is used for unpacking so the exact same step works on Windows, Linux and macOS runners.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unpack the uploaded source zip (skipped if the project is already in the repo)
+        shell: python
+        run: |
+          import glob, os, shutil, sys, zipfile
+
+          if os.path.exists("CMakeLists.txt") and os.path.exists("mod.json"):
+              print("Project files are already in the repository root - nothing to unpack.")
+              sys.exit(0)
+
+          zips = sorted(glob.glob("*.zip"), key=os.path.getmtime, reverse=True)
+          if not zips:
+              sys.exit("ERROR: no CMakeLists.txt/mod.json in the repo root and no .zip file to unpack. "
+                       "Upload the source zip (or the project files) to the repository root.")
+          if len(zips) > 1:
+              print("Several zips found; using the newest:", zips[0])
+
+          shutil.rmtree("_src", ignore_errors=True)
+          with zipfile.ZipFile(zips[0]) as z:
+              z.extractall("_src")
+
+          # The project may sit directly in the zip or inside one folder; find the directory with mod.json.
+          root = None
+          for dirpath, _dirs, files in os.walk("_src"):
+              if "mod.json" in files and "CMakeLists.txt" in files:
+                  root = dirpath
+                  break
+          if root is None:
+              sys.exit("ERROR: the zip does not contain a project with mod.json and CMakeLists.txt.")
+
+          # Never overwrite the workflow itself or git data.
+          for name in os.listdir(root):
+              if name in (".git", ".github"):
+                  continue
+              if os.path.exists(name):
+                  shutil.rmtree(name) if os.path.isdir(name) else os.remove(name)
+              shutil.move(os.path.join(root, name), name)
+          shutil.rmtree("_src", ignore_errors=True)
+
+          print("Unpacked project from", zips[0])
+          print(sorted(os.listdir(".")))
+
+      - name: Build the mod
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: ${{ env.GEODE_SDK_VERSION }}
+          combine: true
+          target: ${{ matrix.config.target }}
+
+  package:
+    name: Combine into one .geode
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - uses: geode-sdk/build-geode-mod/combine@main
+        id: combined
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Auto Decorator (Windows + Android)
+          path: ${{ steps.combined.outputs.build-output }}
